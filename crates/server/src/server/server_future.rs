@@ -49,6 +49,13 @@ pub struct ServerFuture<T: RequestHandler> {
     access: Arc<AccessControl>,
 }
 
+pub trait DnsServerDelegate: 'static {
+    type Stream: futures_util::stream::Stream<Item = Result<SerialMessage, io::Error>>
+        + Send
+        + Unpin;
+    fn split(&self) -> (Self::Stream, BufDnsStreamHandle);
+}
+
 impl<T: RequestHandler> ServerFuture<T> {
     /// Creates a new ServerFuture with the specified Handler.
     pub fn new(handler: T) -> Self {
@@ -67,6 +74,73 @@ impl<T: RequestHandler> ServerFuture<T> {
             shutdown_token: CancellationToken::new(),
             access: Arc::new(access),
         }
+    }
+
+    /// Register a DNS server delegate.
+    pub fn register_delegate<D: DnsServerDelegate>(&mut self, delegate: D) {
+        debug!("registering delegate");
+
+        let (mut stream, stream_handle) = delegate.split();
+        let shutdown = self.shutdown_token.clone();
+        let handler = self.handler.clone();
+        let access = self.access.clone();
+
+        // this spawns a ForEach future which handles all the requests into a Handler.
+        self.join_set.spawn({
+            async move {
+                let mut inner_join_set = JoinSet::new();
+                loop {
+                    let message = tokio::select! {
+                        message = stream.next() => match message {
+                            None => break,
+                            Some(message) => message,
+                        },
+                        _ = shutdown.cancelled() => break,
+                    };
+
+                    let message = match message {
+                        Err(e) => {
+                            warn!("error receiving message on delegate: {}", e);
+                            if is_unrecoverable_socket_error(&e) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Ok(message) => message,
+                    };
+
+                    let src_addr = message.addr();
+                    debug!("received udp request from: {}", src_addr);
+
+                    // verify that the src address is safe for responses
+                    if let Err(e) = sanitize_src_address(src_addr) {
+                        warn!(
+                            "address can not be responded to {src_addr}: {e}",
+                            src_addr = src_addr,
+                        );
+                        continue;
+                    }
+
+                    let handler = handler.clone();
+                    let access = access.clone();
+                    let stream_handle = stream_handle.with_remote_addr(src_addr);
+
+                    inner_join_set.spawn(async move {
+                        handle_raw_request(message, Protocol::Udp, access, handler, stream_handle)
+                            .await;
+                    });
+
+                    reap_tasks(&mut inner_join_set);
+                }
+
+                if shutdown.is_cancelled() {
+                    Ok(())
+                } else {
+                    // TODO: let's consider capturing all the initial configuration details so that the socket could be recreated...
+                    Err(ProtoError::from("unexpected close of UDP socket"))
+                }
+            }
+        });
     }
 
     /// Register a UDP socket. Should be bound before calling this function.
